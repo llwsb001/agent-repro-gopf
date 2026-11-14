@@ -29,4 +29,4 @@ go build -o bench_load bench_load.go
 
 基线（同机、Go 原版 gopf）：15.7k rps，p50 6.0 ms，p99 13 ms；直连后端 30.9k rps。
 
-结果对照见 `复现对比.md`。
+各 Agent 的性能与设计取舍见其目录下的 `bench.md` 与 `README.md`；跨 Agent 的对照结论待两个 PR 合并后补充。
