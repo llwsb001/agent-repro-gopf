@@ -1,0 +1,13 @@
+# Zig
+zig-out/
+.zig-cache/
+zig-cache/
+
+# 运行产物与日志
+*.jsonl
+*.log
+*.out
+
+# 压测二进制
+bench_backend
+bench_load
