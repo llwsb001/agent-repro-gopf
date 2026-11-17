@@ -6,14 +6,25 @@
 //! status, SIGTERM/SIGINT exit.
 
 const std = @import("std");
-const linux = std.os.linux;
 const posix = std.posix;
 const sys = @import("sys.zig");
-const config_mod = @import("config.zig");
 const proxy_mod = @import("proxy.zig");
 const log = @import("log.zig").logf;
 
 const Proxy = proxy_mod.Proxy;
+
+var sig_reload: std.atomic.Value(bool) = .init(false);
+var sig_status: std.atomic.Value(bool) = .init(false);
+var sig_quit: std.atomic.Value(bool) = .init(false);
+
+fn onSignal(sig: posix.SIG) callconv(.c) void {
+    switch (sig) {
+        .HUP => sig_reload.store(true, .release),
+        .USR1 => sig_status.store(true, .release),
+        .TERM, .INT => sig_quit.store(true, .release),
+        else => {},
+    }
+}
 
 fn usage() noreturn {
     log("usage: gopf [-listen host:port] config_file  (default listen :1248)", .{});
@@ -52,8 +63,7 @@ pub fn main(init: std.process.Init) u8 {
         usage();
     };
 
-    // Never let a dead peer kill us with SIGPIPE (writes use MSG_NOSIGNAL
-    // too, this is just a belt-and-suspenders default like Go's).
+    // Ignore SIGPIPE; writes also use MSG_NOSIGNAL / SO_NOSIGPIPE where available.
     const ign: posix.Sigaction = .{
         .handler = .{ .handler = posix.SIG.IGN },
         .mask = posix.sigemptyset(),
@@ -61,20 +71,17 @@ pub fn main(init: std.process.Init) u8 {
     };
     posix.sigaction(.PIPE, &ign, null);
 
-    // Block the handled signals in every thread (all threads inherit this
-    // mask) and receive them through a signalfd instead.
-    var sigs = posix.sigemptyset();
-    posix.sigaddset(&sigs, .HUP);
-    posix.sigaddset(&sigs, .USR1);
-    posix.sigaddset(&sigs, .TERM);
-    posix.sigaddset(&sigs, .INT);
-    posix.sigprocmask(posix.SIG.BLOCK, &sigs, null);
-    const sig_fd = posix.signalfd(-1, &sigs, linux.SFD.CLOEXEC) catch |e| {
-        log("signalfd failed: {s}", .{@errorName(e)});
-        return 1;
+    // Async-signal-safe handlers only flip atomics; a watcher thread does the work.
+    const act: posix.Sigaction = .{
+        .handler = .{ .handler = onSignal },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
     };
+    posix.sigaction(.HUP, &act, null);
+    posix.sigaction(.USR1, &act, null);
+    posix.sigaction(.TERM, &act, null);
+    posix.sigaction(.INT, &act, null);
 
-    // Listen socket.
     const hp = sys.splitHostPort(listen_text) catch |e| {
         log("invalid listen address '{s}': {s}", .{ listen_text, @errorName(e) });
         return 1;
@@ -88,13 +95,12 @@ pub fn main(init: std.process.Init) u8 {
         return 1;
     };
 
-    // Initial config load is fatal on failure, like the Go original.
     proxy.loadConfigFile(path) catch {
         log("failed to load initial configuration from '{s}'; exiting", .{path});
         return 1;
     };
 
-    const st = std.Thread.spawn(.{}, signalThread, .{ proxy, sig_fd, path }) catch |e| {
+    const st = std.Thread.spawn(.{}, signalThread, .{ proxy, path }) catch |e| {
         log("failed to spawn signal thread: {s}", .{@errorName(e)});
         return 1;
     };
@@ -106,30 +112,26 @@ pub fn main(init: std.process.Init) u8 {
 }
 
 test {
-    // Pull in tests from all imported modules.
     _ = @import("sys.zig");
     _ = @import("config.zig");
     _ = @import("proxy.zig");
 }
 
-fn signalThread(proxy: *Proxy, sig_fd: sys.fd_t, config_path: []const u8) void {
+fn signalThread(proxy: *Proxy, config_path: []const u8) void {
     while (true) {
-        var info: linux.signalfd_siginfo = undefined;
-        const n = posix.read(sig_fd, std.mem.asBytes(&info)) catch continue;
-        if (n < @sizeOf(linux.signalfd_siginfo)) continue;
-        const sig = info.signo;
-        if (sig == @intFromEnum(linux.SIG.HUP)) {
+        if (sig_quit.swap(false, .acq_rel)) {
+            log("received terminate signal, shutting down", .{});
+            std.process.exit(0);
+        }
+        if (sig_reload.swap(false, .acq_rel)) {
             log("SIGHUP received: reloading configuration", .{});
             if (proxy.loadConfigFile(config_path)) {
                 log("configuration reloaded successfully", .{});
-            } else |_| {
-                // loadConfigFile already logged the reason; old config kept.
-            }
-        } else if (sig == @intFromEnum(linux.SIG.USR1)) {
-            proxy.printStatus();
-        } else if (sig == @intFromEnum(linux.SIG.TERM) or sig == @intFromEnum(linux.SIG.INT)) {
-            log("received signal {d}, shutting down", .{sig});
-            std.process.exit(0);
+            } else |_| {}
         }
+        if (sig_status.swap(false, .acq_rel)) {
+            proxy.printStatus();
+        }
+        sys.sleepMs(10);
     }
 }

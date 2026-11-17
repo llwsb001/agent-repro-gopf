@@ -2,7 +2,7 @@
 
 参考 Go 版 gopf 的语义用 Zig 0.17 重写：监听本地端口，按**加权随机**选择后端，
 建立连接后双向转发，支持半关闭传播、配置热加载与信号控制。
-只依赖 Zig 标准库与 Linux 系统调用（不链接 libc，无任何第三方依赖）。
+只依赖 Zig 标准库与系统调用（链接 libc；支持 **Linux** 与 **macOS**，无第三方依赖）。
 
 ## 编译
 
@@ -27,8 +27,8 @@ zig build test                     # 单元测试 + 集成测试（18 个用例�
 {"hosts":[{"addr":"127.0.0.1:18091","weight":100}]}
 ```
 
-字段名大小写不敏感（兼容参考实现的 `"Hosts"/"Addr"/"Weight"` 写法）。
-`weight` 为负、`addr` 不能拆成 `host:port`（要求数字端口）→ 整次加载失败；
+字段名固定小写：`hosts` / `addr` / `weight`（`std.json` typed parse）。
+`weight` 缺省为 0；为负、或 `addr` 不能拆成 `host:port`（要求数字端口）→ 整次加载失败；
 `hosts` 为空或全零权重 → 加载成功但 `weight_sum<=0`，新连接立即关闭。
 
 信号：
@@ -39,24 +39,23 @@ zig build test                     # 单元测试 + 集成测试（18 个用例�
 | `SIGUSR1` | 打印状态：活跃/累计连接数、拨号失败数、worker 数、当前配置摘要 |
 | `SIGTERM` / `SIGINT` | 退出 |
 
-信号统一在启动时 `sigprocmask` 屏蔽、经 **signalfd** 由专用线程同步处理，
-避免异步信号句柄里的锁/分配问题。`SIGPIPE` 被忽略，套接字写一律带
-`MSG_NOSIGNAL`。
+信号 handler 只置原子标志，由专用线程轮询处理（避免在 handler 里拿锁/分配；
+Linux / macOS 通用）。`SIGPIPE` 被忽略；写侧尽量带 `MSG_NOSIGNAL`，macOS
+另开 `SO_NOSIGPIPE`。
 
 ## 行为要点（与 Go 版对齐）
 
 - **选后端**：每连接取 `[0, weight_sum)` 均匀随机数（无偏 `uintLessThan`），
   按累计权重落点；weight 0 的后端永不命中；`weight_sum<=0` → 直接关闭。
-- **拨号超时 5s**：阻塞 `connect` + `SO_SNDTIMEO`（Linux 对 connect 生效），
-  成功后立刻把发送超时复位为无限，避免影响转发阶段。
+- **拨号超时 5s**：阻塞 `connect` + `SO_SNDTIMEO`，成功后立刻把发送超时复位为
+  无限，避免影响转发阶段。
 - **转发**：一侧 EOF/出错 → 对另一侧 `shutdown(WR)` 半关闭；两侧都结束才关闭
   整条连接。半关闭后剩余数据照常传完（有集成测试覆盖）。
-- **TCP 选项**：两侧均 `TCP_NODELAY`（Go net 包默认）+ `SO_KEEPALIVE`，
-  `TCP_KEEPIDLE=TCP_KEEPINTVL=60s`（对应 Go 的 `SetKeepAlivePeriod(60s)`）。
-- **地址解析**：无 libc 所以没有 DNS；支持 IPv4/IPv6 字面量（含 `[v6]:port`、
-  `::` 压缩、内嵌 v4）、空 host、`localhost`。普通域名配置可加载，拨号时
-  报 `cannot resolve host name` 并计入 `dial_errors`（Go 里同类名字也是
-  拨号期才失败）。
+- **TCP 选项**：两侧均 `TCP_NODELAY` + `SO_KEEPALIVE`；Linux 用
+  `TCP_KEEPIDLE/KEEPINTVL=60s`，macOS 用 `TCP_KEEPALIVE=60`（空闲秒数）。
+- **地址解析**：不做 DNS；支持 IPv4/IPv6 字面量（含 `[v6]:port`、`::` 压缩、
+  内嵌 v4）、空 host、`localhost`。普通域名配置可加载，拨号时报
+  `cannot resolve host name` 并计入 `dial_errors`。
 
 ## 设计取舍
 
@@ -66,7 +65,7 @@ Go 原版是"每连接 3 个 goroutine"。Zig 里裸线程创建实测约 85 µs
 每连接 2 次创建会把吞吐钉死在 ~5k rps。因此：
 
 - **主线程**只做 accept：成功后将 `(fd, peer)` 推入 4096 槽环形任务队列
-  （futex 信号量同步，满则阻塞 → 背压回落到内核 accept 队列）。
+  （Linux futex / Darwin ulock 信号量同步，满则阻塞 → 背压回落到内核 accept 队列）。
 - **worker 池**预生成 `max(32, 4×nCPU)` 个线程；队列深度超过空闲 worker 时
   按需扩容（上限 4096），突发过后多余 worker 以原子 cmpxchg"认领退休"
   （先原子减计数再退出，杜绝把池子击穿到 base 以下的竞态）。
@@ -89,8 +88,8 @@ Go 原版是"每连接 3 个 goroutine"。Zig 里裸线程创建实测约 85 µs
 src/main.zig    CLI 参数、信号（signalfd）、启动流程
 src/proxy.zig   accept 循环、worker 池、poll 双工转发、reload/status（+集成测试）
 src/config.zig  JSON 解析与校验、加权随机选择（+单元测试）
-src/sys.zig     裸 Linux syscall 封装：socket/connect/bind/listen/accept4/
-                setsockopt/poll/sendto、地址解析与格式化
+src/sys.zig     可移植 socket 封装（libc）：listen/accept/connect/读写、
+                keepalive、地址解析与格式化
 src/log.zig     单行一次 write 的线程安全日志
 ```
 
@@ -98,7 +97,7 @@ src/log.zig     单行一次 write 的线程安全日志
 
 `zig build test` 一条命令跑完（18 个用例全绿）：
 
-- 配置：合法配置、Go 风格大写键、非法地址（无端口/端口越界/非数字/未加
+- 配置：合法配置、拒绝大写键、非法地址（无端口/端口越界/非数字/未加
   方括号 IPv6 等）、负权重、空 hosts、全零权重、非整数 weight。
 - 加权选择：固定种子 10 万次抽取，1:2 权重占比落在 1/3±1.7 个百分点内；
   weight 0 后端 10 万次零命中；单后端恒命中。

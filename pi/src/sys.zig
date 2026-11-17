@@ -1,13 +1,13 @@
-//! Thin wrappers over raw Linux syscalls (no libc) for TCP networking.
-//! Every socket gopf creates is blocking; the connect timeout is implemented
-//! with SO_SNDTIMEO which Linux honors for blocking connect(2).
+//! Portable TCP helpers over libc/posix (Linux + macOS).
+//! Sockets are blocking; connect timeout uses SO_SNDTIMEO.
 
 const std = @import("std");
-const linux = std.os.linux;
+const builtin = @import("builtin");
 const posix = std.posix;
+const c = std.c;
 
-pub const fd_t = linux.fd_t;
-pub const socklen_t = linux.socklen_t;
+pub const fd_t = posix.fd_t;
+pub const socklen_t = posix.socklen_t;
 
 pub const SockError = error{
     Timeout,
@@ -21,65 +21,67 @@ pub const SockError = error{
     Unexpected,
 };
 
+const is_darwin = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst => true,
+    else => false,
+};
+
 /// Owned socket address (IPv4 or IPv6), value type.
 pub const SockAddr = struct {
-    storage: linux.sockaddr.storage = .{ .family = 0, .padding = undefined },
+    storage: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage),
     len: socklen_t = 0,
 
-    pub fn family(self: *const SockAddr) u16 {
+    pub fn family(self: *const SockAddr) posix.sa_family_t {
         return self.storage.family;
     }
 
-    pub fn ptr(self: *const SockAddr) *const linux.sockaddr {
+    pub fn ptr(self: *const SockAddr) *const posix.sockaddr {
         return @ptrCast(&self.storage);
     }
 
-    pub fn ptrMut(self: *SockAddr) *linux.sockaddr {
+    pub fn ptrMut(self: *SockAddr) *posix.sockaddr {
         return @ptrCast(&self.storage);
     }
 
     pub fn port(self: *const SockAddr) u16 {
         return switch (self.family()) {
-            linux.AF.INET => std.mem.bigToNative(u16, self.inConst().port),
-            linux.AF.INET6 => std.mem.bigToNative(u16, self.in6Const().port),
+            posix.AF.INET => std.mem.bigToNative(u16, self.inConst().port),
+            posix.AF.INET6 => std.mem.bigToNative(u16, self.in6Const().port),
             else => 0,
         };
     }
 
-    pub fn inConst(self: *const SockAddr) *const linux.sockaddr.in {
+    pub fn inConst(self: *const SockAddr) *const posix.sockaddr.in {
         return @ptrCast(&self.storage);
     }
 
-    pub fn in6Const(self: *const SockAddr) *const linux.sockaddr.in6 {
+    pub fn in6Const(self: *const SockAddr) *const posix.sockaddr.in6 {
         return @ptrCast(&self.storage);
     }
 };
 
-pub fn sockaddrIp4(octets: [4]u8, port: u16) SockAddr {
+pub fn sockaddrIp4(octets: [4]u8, port_num: u16) SockAddr {
     var sa: SockAddr = .{};
-    const in: *linux.sockaddr.in = @ptrCast(&sa.storage);
+    const in: *posix.sockaddr.in = @ptrCast(@alignCast(&sa.storage));
     in.* = .{
-        .family = linux.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
+        .port = std.mem.nativeToBig(u16, port_num),
         .addr = 0,
-        .zero = @splat(0),
     };
     @memcpy(@as(*[4]u8, @ptrCast(&in.addr)), &octets);
-    sa.len = @sizeOf(linux.sockaddr.in);
+    sa.len = @sizeOf(posix.sockaddr.in);
     return sa;
 }
 
-pub fn sockaddrIp6(bytes: [16]u8, port: u16) SockAddr {
+pub fn sockaddrIp6(bytes: [16]u8, port_num: u16) SockAddr {
     var sa: SockAddr = .{};
-    const in6: *linux.sockaddr.in6 = @ptrCast(&sa.storage);
+    const in6: *posix.sockaddr.in6 = @ptrCast(@alignCast(&sa.storage));
     in6.* = .{
-        .family = linux.AF.INET6,
-        .port = std.mem.nativeToBig(u16, port),
+        .port = std.mem.nativeToBig(u16, port_num),
         .flowinfo = 0,
         .addr = bytes,
         .scope_id = 0,
     };
-    sa.len = @sizeOf(linux.sockaddr.in6);
+    sa.len = @sizeOf(posix.sockaddr.in6);
     return sa;
 }
 
@@ -93,9 +95,9 @@ pub fn parseIp4(text: []const u8) ?[4]u8 {
         if (part.len == 0 or part.len > 3) return null;
         if (part.len > 1 and part[0] == '0') return null;
         var v: u16 = 0;
-        for (part) |c| {
-            if (c < '0' or c > '9') return null;
-            v = v * 10 + (c - '0');
+        for (part) |ch| {
+            if (ch < '0' or ch > '9') return null;
+            v = v * 10 + (ch - '0');
         }
         if (v > 255) return null;
         parts[i] = @intCast(v);
@@ -107,11 +109,11 @@ pub fn parseIp4(text: []const u8) ?[4]u8 {
 fn parseHextet(s: []const u8) ?u16 {
     if (s.len == 0 or s.len > 4) return null;
     var v: u16 = 0;
-    for (s) |c| {
-        const d: u16 = switch (c) {
-            '0'...'9' => c - '0',
-            'a'...'f' => c - 'a' + 10,
-            'A'...'F' => c - 'A' + 10,
+    for (s) |ch| {
+        const d: u16 = switch (ch) {
+            '0'...'9' => ch - '0',
+            'a'...'f' => ch - 'a' + 10,
+            'A'...'F' => ch - 'A' + 10,
             else => return null,
         };
         v = v * 16 + d;
@@ -119,15 +121,13 @@ fn parseHextet(s: []const u8) ?u16 {
     return v;
 }
 
-/// Parse a ':'-separated run of hextets (optionally ending in an IPv4 tail)
-/// into up to 8 groups. Returns group count.
 fn parseIp6Groups(text: []const u8, groups: *[8]u16, allow_v4: bool) ?usize {
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, text, ':');
     while (it.next()) |g| {
-        if (g.len == 0) return null; // empty group: caller handles "::"
+        if (g.len == 0) return null;
         if (allow_v4 and std.mem.indexOfScalar(u8, g, '.') != null) {
-            if (it.peek() != null) return null; // v4 tail must be last
+            if (it.peek() != null) return null;
             const v4 = parseIp4(g) orelse return null;
             if (n + 2 > 8) return null;
             groups[n] = (@as(u16, v4[0]) << 8) | v4[1];
@@ -150,8 +150,6 @@ fn groupsToBytes(groups: *const [8]u16) [16]u8 {
     return bytes;
 }
 
-/// Parse an IPv6 literal, supporting "::" compression and embedded IPv4
-/// ("::ffff:1.2.3.4"). Zone identifiers ("fe80::1%eth0") are not supported.
 pub fn parseIp6(text: []const u8) ?[16]u8 {
     var groups: [8]u16 = @splat(0);
     if (std.mem.indexOf(u8, text, "::")) |idx| {
@@ -162,7 +160,7 @@ pub fn parseIp6(text: []const u8) ?[16]u8 {
         const tail_txt = text[idx + 2 ..];
         const nh = if (head_txt.len == 0) 0 else (parseIp6Groups(head_txt, &head_g, false) orelse return null);
         const nt = if (tail_txt.len == 0) 0 else (parseIp6Groups(tail_txt, &tail_g, true) orelse return null);
-        if (nh + nt > 7) return null; // "::" must stand for at least one group
+        if (nh + nt > 7) return null;
         @memcpy(groups[0..nh], head_g[0..nh]);
         @memcpy(groups[8 - nt .. 8], tail_g[0..nt]);
     } else {
@@ -182,9 +180,6 @@ pub const SplitError = error{
     InvalidPort,
 };
 
-/// Split "host:port" with Go net.SplitHostPort-compatible bracket handling.
-/// Additionally requires a numeric port (we cannot resolve service names
-/// without libc/DNS). Host may be empty (":1248").
 pub fn splitHostPort(addr: []const u8) SplitError!HostPort {
     var host: []const u8 = undefined;
     var port_text: []const u8 = undefined;
@@ -196,52 +191,47 @@ pub fn splitHostPort(addr: []const u8) SplitError!HostPort {
     } else {
         const colons = std.mem.count(u8, addr, ":");
         if (colons == 0) return error.MissingPort;
-        if (colons > 1) return error.TooManyColons; // unbracketed IPv6
+        if (colons > 1) return error.TooManyColons;
         const idx = std.mem.indexOfScalar(u8, addr, ':').?;
         host = addr[0..idx];
         port_text = addr[idx + 1 ..];
     }
     if (port_text.len == 0) return error.EmptyPort;
-    const port = std.fmt.parseInt(u16, port_text, 10) catch return error.InvalidPort;
-    return .{ .host = host, .port = port };
+    const port_num = std.fmt.parseInt(u16, port_text, 10) catch return error.InvalidPort;
+    return .{ .host = host, .port = port_num };
 }
 
-/// Resolve a backend dial target. Empty host means loopback (like Go's dial
-/// of ":80"). "localhost" maps to 127.0.0.1. Arbitrary DNS names are not
-/// resolvable without libc; they fail here with error.UnknownHost.
-pub fn resolveDial(host: []const u8, port: u16) SockError!SockAddr {
+pub fn resolveDial(host: []const u8, port_num: u16) SockError!SockAddr {
     if (host.len == 0 or std.ascii.eqlIgnoreCase(host, "localhost")) {
-        return sockaddrIp4(.{ 127, 0, 0, 1 }, port);
+        return sockaddrIp4(.{ 127, 0, 0, 1 }, port_num);
     }
-    if (parseIp4(host)) |octets| return sockaddrIp4(octets, port);
+    if (parseIp4(host)) |octets| return sockaddrIp4(octets, port_num);
     if (std.mem.indexOfScalar(u8, host, ':') != null) {
-        if (parseIp6(host)) |bytes| return sockaddrIp6(bytes, port);
+        if (parseIp6(host)) |bytes| return sockaddrIp6(bytes, port_num);
     }
     return error.UnknownHost;
 }
 
-/// Resolve a listen address. Empty host means the wildcard address.
-pub fn resolveListen(host: []const u8, port: u16) SockError!SockAddr {
-    if (host.len == 0) return sockaddrIp4(.{ 0, 0, 0, 0 }, port);
-    if (std.ascii.eqlIgnoreCase(host, "localhost")) return sockaddrIp4(.{ 127, 0, 0, 1 }, port);
-    if (parseIp4(host)) |octets| return sockaddrIp4(octets, port);
+pub fn resolveListen(host: []const u8, port_num: u16) SockError!SockAddr {
+    if (host.len == 0) return sockaddrIp4(.{ 0, 0, 0, 0 }, port_num);
+    if (std.ascii.eqlIgnoreCase(host, "localhost")) return sockaddrIp4(.{ 127, 0, 0, 1 }, port_num);
+    if (parseIp4(host)) |octets| return sockaddrIp4(octets, port_num);
     if (std.mem.indexOfScalar(u8, host, ':') != null) {
-        if (parseIp6(host)) |bytes| return sockaddrIp6(bytes, port);
+        if (parseIp6(host)) |bytes| return sockaddrIp6(bytes, port_num);
     }
     return error.UnknownHost;
 }
 
-/// Write "a.b.c.d:port" or "[v6]:port" into buf.
 pub fn formatSockAddr(buf: []u8, sa: *const SockAddr) []const u8 {
     switch (sa.family()) {
-        linux.AF.INET => {
+        posix.AF.INET => {
             const in = sa.inConst();
             const b: *const [4]u8 = @ptrCast(&in.addr);
             return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
                 b[0], b[1], b[2], b[3], sa.port(),
             }) catch buf[0..0];
         },
-        linux.AF.INET6 => {
+        posix.AF.INET6 => {
             const b = &sa.in6Const().addr;
             var g: [8]u16 = undefined;
             for (0..8) |i| g[i] = (@as(u16, b[2 * i]) << 8) | b[2 * i + 1];
@@ -253,10 +243,10 @@ pub fn formatSockAddr(buf: []u8, sa: *const SockAddr) []const u8 {
     }
 }
 
-fn mapCommonErr(e: linux.E) SockError {
+fn mapCommonErr(e: posix.E) SockError {
     return switch (e) {
         .CONNREFUSED => error.Refused,
-        .TIMEDOUT, .TIME => error.Timeout,
+        .TIMEDOUT => error.Timeout,
         .NETUNREACH, .HOSTUNREACH, .NETDOWN => error.Unreachable,
         .ADDRINUSE => error.AddrInUse,
         .ADDRNOTAVAIL => error.AddrNotAvail,
@@ -266,63 +256,68 @@ fn mapCommonErr(e: linux.E) SockError {
     };
 }
 
-pub fn errnoTag(rc: usize) []const u8 {
-    return @tagName(linux.errno(rc));
+fn setCloexec(fd: fd_t) void {
+    _ = c.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
 }
 
-pub fn socket(family: u16) SockError!fd_t {
-    const rc = linux.socket(family, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-    return switch (linux.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        else => |e| mapCommonErr(e),
-    };
+pub fn socket(family: posix.sa_family_t) SockError!fd_t {
+    const rc = c.socket(family, posix.SOCK.STREAM, 0);
+    if (rc < 0) return mapCommonErr(posix.errno(rc));
+    setCloexec(rc);
+    return rc;
 }
 
 pub fn closeFd(fd: fd_t) void {
-    _ = linux.close(fd);
+    _ = c.close(fd);
 }
 
 pub fn shutdownWr(fd: fd_t) void {
-    _ = linux.shutdown(fd, linux.SHUT.WR);
+    _ = c.shutdown(fd, posix.SHUT.WR);
 }
 
 fn setsockoptInt(fd: fd_t, level: i32, optname: u32, value: c_int) void {
     posix.setsockopt(fd, level, optname, std.mem.asBytes(&value)) catch {};
 }
 
-/// Go's net package defaults: TCP_NODELAY on, SO_KEEPALIVE on with a 60s
-/// idle/interval period (SetKeepAlivePeriod(60s) sets both).
+/// Go net defaults: TCP_NODELAY + keepalive ~60s idle/interval.
 pub fn setTcpOpts(fd: fd_t) void {
-    setsockoptInt(fd, linux.SOL.SOCKET, linux.SO.KEEPALIVE, 1);
-    setsockoptInt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPIDLE, 60);
-    setsockoptInt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPINTVL, 60);
-    setsockoptInt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, 1);
+    setsockoptInt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, 1);
+    setsockoptInt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, 1);
+    if (builtin.os.tag == .linux) {
+        setsockoptInt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPIDLE, 60);
+        setsockoptInt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, 60);
+    } else {
+        // Darwin: TCP.KEEPALIVE is idle seconds when SO_KEEPALIVE is on.
+        setsockoptInt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPALIVE, 60);
+        if (@hasDecl(posix.TCP, "KEEPINTVL")) {
+            setsockoptInt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, 60);
+        }
+    }
+    if (is_darwin and @hasDecl(posix.SO, "NOSIGPIPE")) {
+        setsockoptInt(fd, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, 1);
+    }
 }
 
-/// Create, bind and listen a TCP socket. SO_REUSEADDR like Go's net.Listen.
 pub fn listenTcp(addr: *const SockAddr, backlog: u32) SockError!fd_t {
     const fd = try socket(addr.family());
     errdefer closeFd(fd);
-    setsockoptInt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, 1);
-    switch (linux.errno(linux.bind(fd, addr.ptr(), addr.len))) {
-        .SUCCESS => {},
-        else => |e| return mapCommonErr(e),
-    }
-    switch (linux.errno(linux.listen(fd, backlog))) {
-        .SUCCESS => {},
-        else => |e| return mapCommonErr(e),
-    }
+    setsockoptInt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
+    if (c.bind(fd, addr.ptr(), addr.len) < 0) return mapCommonErr(posix.errno(-1));
+    if (c.listen(fd, backlog) < 0) return mapCommonErr(posix.errno(-1));
     return fd;
 }
 
 pub fn acceptTcp(listen_fd: fd_t, peer: *SockAddr) SockError!fd_t {
     while (true) {
-        peer.len = @sizeOf(linux.sockaddr.storage);
-        const rc = linux.accept4(listen_fd, peer.ptrMut(), &peer.len, linux.SOCK.CLOEXEC);
-        switch (linux.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
+        peer.len = @sizeOf(posix.sockaddr.storage);
+        const rc = c.accept(listen_fd, peer.ptrMut(), &peer.len);
+        if (rc >= 0) {
+            setCloexec(rc);
+            return rc;
+        }
+        switch (posix.errno(rc)) {
             .INTR => continue,
-            .CONNABORTED => continue, // peer already gone; keep accepting
+            .CONNABORTED => continue,
             .MFILE, .NFILE => return error.FdQuota,
             .NOBUFS, .NOMEM => return error.SystemResources,
             else => return error.Unexpected,
@@ -330,77 +325,80 @@ pub fn acceptTcp(listen_fd: fd_t, peer: *SockAddr) SockError!fd_t {
     }
 }
 
-/// Blocking connect(2) with a timeout via SO_SNDTIMEO (Linux honors the send
-/// timeout for connection establishment). The timeout is reset to infinite
-/// after the connection is up so later sends block like Go's.
 pub fn connectTimeout(addr: *const SockAddr, timeout_ms: u32) SockError!fd_t {
     const fd = try socket(addr.family());
     errdefer closeFd(fd);
 
-    const tv: linux.timeval = .{
+    const tv: posix.timeval = .{
         .sec = @intCast(timeout_ms / 1000),
         .usec = @intCast((timeout_ms % 1000) * 1000),
     };
-    posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
 
-    switch (linux.errno(linux.connect(fd, addr.ptr(), addr.len))) {
-        .SUCCESS => {},
-        .INTR => return error.Timeout, // interrupted blocking connect: treat as failure
-        .AGAIN => return error.Timeout,
-        else => |e| return mapCommonErr(e),
+    if (c.connect(fd, addr.ptr(), addr.len) < 0) {
+        switch (posix.errno(-1)) {
+            .INTR => return error.Timeout,
+            .AGAIN => return error.Timeout,
+            else => |e| return mapCommonErr(e),
+        }
     }
 
-    // Back to infinite send timeout for the forwarding phase.
-    const zero: linux.timeval = .{ .sec = 0, .usec = 0 };
-    posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDTIMEO, std.mem.asBytes(&zero)) catch {};
+    const zero: posix.timeval = .{ .sec = 0, .usec = 0 };
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&zero)) catch {};
     return fd;
 }
 
-/// Send the whole buffer, retrying short writes and EINTR. MSG_NOSIGNAL so a
-/// dead peer never raises SIGPIPE (we also ignore SIGPIPE in main).
+fn sendFlags() u32 {
+    if (@hasDecl(posix.MSG, "NOSIGNAL")) return posix.MSG.NOSIGNAL;
+    return 0;
+}
+
 pub fn writeAll(fd: fd_t, bytes: []const u8) SockError!void {
     var off: usize = 0;
     while (off < bytes.len) {
-        const rc = linux.sendto(fd, bytes.ptr + off, bytes.len - off, linux.MSG.NOSIGNAL, null, 0);
-        switch (linux.errno(rc)) {
-            .SUCCESS => off += rc,
-            .INTR => continue,
-            .PIPE, .CONNRESET => return error.Refused,
-            else => |e| return mapCommonErr(e),
+        const n = c.send(fd, bytes.ptr + off, bytes.len - off, sendFlags());
+        if (n < 0) {
+            switch (posix.errno(n)) {
+                .INTR => continue,
+                .PIPE, .CONNRESET => return error.Refused,
+                else => |e| return mapCommonErr(e),
+            }
         }
+        off += @intCast(n);
     }
 }
 
-/// Read once; 0 means EOF. Retries EINTR.
 pub fn readSome(fd: fd_t, buf: []u8) SockError!usize {
     while (true) {
-        const rc = linux.read(fd, buf.ptr, buf.len);
-        switch (linux.errno(rc)) {
-            .SUCCESS => return rc,
-            .INTR => continue,
-            .CONNRESET => return error.Refused,
-            else => |e| return mapCommonErr(e),
+        const n = c.read(fd, buf.ptr, buf.len);
+        if (n < 0) {
+            switch (posix.errno(n)) {
+                .INTR => continue,
+                .CONNRESET => return error.Refused,
+                else => |e| return mapCommonErr(e),
+            }
         }
+        return @intCast(n);
     }
 }
 
 pub fn getSockName(fd: fd_t) SockError!SockAddr {
     var sa: SockAddr = .{};
-    sa.len = @sizeOf(linux.sockaddr.storage);
-    return switch (linux.errno(linux.getsockname(fd, sa.ptrMut(), &sa.len))) {
-        .SUCCESS => sa,
-        else => |e| mapCommonErr(e),
-    };
+    sa.len = @sizeOf(posix.sockaddr.storage);
+    if (c.getsockname(fd, sa.ptrMut(), &sa.len) < 0) return mapCommonErr(posix.errno(-1));
+    return sa;
 }
 
 pub fn sleepMs(ms: u64) void {
-    var ts: linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
-    _ = linux.nanosleep(&ts, null);
+    var ts: posix.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * 1_000_000),
+    };
+    _ = c.nanosleep(&ts, null);
 }
 
-/// Read an entire (small) file into memory.
 pub fn readFileAlloc(gpa: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    const fd = posix.openat(linux.AT.FDCWD, path, .{}, 0) catch return error.FileOpen;
+    const fd = posix.openat(posix.AT.FDCWD, path, .{}, 0) catch return error.FileOpen;
     defer closeFd(fd);
     var buf = std.array_list.Managed(u8).init(gpa);
     errdefer buf.deinit();
@@ -415,7 +413,32 @@ pub fn readFileAlloc(gpa: std.mem.Allocator, path: []const u8, max_bytes: usize)
 }
 
 pub fn nanosNow() u64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @intCast(ts.sec * 1_000_000_000 + ts.nsec);
+    var ts: posix.timespec = undefined;
+    _ = c.clock_gettime(posix.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+pub fn getPid() i32 {
+    return c.getpid();
+}
+
+pub fn unlinkPath(path: []const u8) void {
+    var buf: [256]u8 = undefined;
+    const zpath = std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return;
+    _ = c.unlink(zpath);
+}
+
+pub fn writeFile(path: []const u8, content: []const u8) void {
+    const fd = posix.openat(posix.AT.FDCWD, path, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .TRUNC = true,
+    }, 0o644) catch @panic("openat");
+    defer closeFd(fd);
+    var off: usize = 0;
+    while (off < content.len) {
+        const n = c.write(fd, content.ptr + off, content.len - off);
+        if (n < 0) @panic("write");
+        off += @intCast(n);
+    }
 }

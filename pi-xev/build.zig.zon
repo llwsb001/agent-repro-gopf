@@ -1,0 +1,13 @@
+.{
+    .name = .gopf_xev,
+    .version = "0.0.0",
+    .fingerprint = 0xb7c2a81c1f27c172,
+    .minimum_zig_version = "0.17.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src", "settings.conf" },
+    .dependencies = .{
+        .libxev = .{
+            .url = "git+https://github.com/mitchellh/libxev?ref=main#451a2bc03644c2b70fb28a808313d12989bfa8e3",
+            .hash = "libxev-0.0.0-86vtc8QQFACz0sVc7U-VDiDIgH-XfBuEY5JpABLjHNpn",
+        },
+    },
+}

@@ -1,20 +1,16 @@
 //! Proxy core: accept loop, weighted backend selection, bidirectional
 //! forwarding with half-close propagation, and hot config reload.
 //!
-//! Threading model: a pool of pre-spawned worker threads (raw thread
-//! creation costs ~85us on this kernel, far too much to pay per connection
-//! like the Go original pays per goroutine). The accept loop hands each
-//! connection to a worker through a bounded lock-free-ish ring queue with
-//! futex wakeups; a worker runs the whole connection lifetime, duplexing
-//! both directions in a single poll(2) loop (no second thread per
-//! connection). The pool grows on demand up to max_workers and shrinks back
-//! when the burst is over.
+//! Threading model: a pool of pre-spawned worker threads. The accept loop
+//! hands each connection to a worker through a bounded ring queue with
+//! futex/ulock wakeups; a worker runs the whole connection lifetime,
+//! duplexing both directions in a single poll(2) loop.
 //!
 //! All buffers live on thread stacks; the hot path performs no heap
 //! allocations.
 
 const std = @import("std");
-const linux = std.os.linux;
+const builtin = @import("builtin");
 const posix = std.posix;
 const sys = @import("sys.zig");
 const log = @import("log.zig").logf;
@@ -42,32 +38,79 @@ const SpinLock = struct {
     }
 };
 
-/// Futex-backed counting semaphore (raw linux syscalls, no Io runtime).
-const FutexSem = struct {
+fn futexWake(ptr: *std.atomic.Value(u32)) void {
+    switch (builtin.os.tag) {
+        .linux => {
+            const linux = std.os.linux;
+            _ = linux.futex(&ptr.raw, .{ .cmd = .WAKE, .private = true }, 1, .{ .val2 = 0 }, null, 0);
+        },
+        .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst => {
+            const c = std.c;
+            const flags: c.UL = .{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true };
+            while (true) {
+                const status = c.__ulock_wake(flags, &ptr.raw, 0);
+                if (status >= 0) return;
+                switch (@as(c.E, @fromBackingInt(@intCast(@as(u16, @intCast(-status)))))) {
+                    .INTR => continue,
+                    .NOENT => return,
+                    else => return,
+                }
+            }
+        },
+        else => @compileError("unsupported OS for CountSem"),
+    }
+}
+
+fn futexWait(ptr: *std.atomic.Value(u32), expected: u32, timeout_ns: ?u64) void {
+    switch (builtin.os.tag) {
+        .linux => {
+            const linux = std.os.linux;
+            if (timeout_ns) |ns| {
+                var ts: linux.timespec = .{
+                    .sec = @intCast(ns / 1_000_000_000),
+                    .nsec = @intCast(ns % 1_000_000_000),
+                };
+                _ = linux.futex(&ptr.raw, .{ .cmd = .WAIT, .private = true }, expected, .{ .timeout = &ts }, null, 0);
+            } else {
+                _ = linux.futex(&ptr.raw, .{ .cmd = .WAIT, .private = true }, expected, .{ .val2 = 0 }, null, 0);
+            }
+        },
+        .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst => {
+            const c = std.c;
+            const flags: c.UL = .{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true };
+            const ns = timeout_ns orelse 0; // 0 = wait forever for __ulock_wait2
+            _ = c.__ulock_wait2(flags, &ptr.raw, expected, ns, 0);
+        },
+        else => @compileError("unsupported OS for CountSem"),
+    }
+}
+
+/// Counting semaphore via Linux futex / Darwin ulock.
+const CountSem = struct {
     count: std.atomic.Value(u32),
 
-    fn init(v: u32) FutexSem {
+    fn init(v: u32) CountSem {
         return .{ .count = std.atomic.Value(u32).init(v) };
     }
 
-    fn post(self: *FutexSem) void {
+    fn post(self: *CountSem) void {
         _ = self.count.fetchAdd(1, .release);
-        _ = linux.futex(&self.count.raw, .{ .cmd = .WAKE, .private = true }, 1, .{ .val2 = 0 }, null, 0);
+        futexWake(&self.count);
     }
 
-    fn wait(self: *FutexSem) void {
+    fn wait(self: *CountSem) void {
         while (true) {
             var c = self.count.load(.acquire);
             while (c > 0) {
                 if (self.count.cmpxchgWeak(c, c - 1, .acquire, .monotonic) == null) return;
                 c = self.count.load(.acquire);
             }
-            _ = linux.futex(&self.count.raw, .{ .cmd = .WAIT, .private = true }, 0, .{ .val2 = 0 }, null, 0);
+            futexWait(&self.count, 0, null);
         }
     }
 
     /// Returns false on timeout (used so workers can notice shutdown).
-    fn waitTimeout(self: *FutexSem, ms: u32) bool {
+    fn waitTimeout(self: *CountSem, ms: u32) bool {
         const deadline = sys.nanosNow() + @as(u64, ms) * 1_000_000;
         while (true) {
             var c = self.count.load(.acquire);
@@ -77,11 +120,7 @@ const FutexSem = struct {
             }
             const left_ns = deadline -| sys.nanosNow();
             if (left_ns == 0) return false;
-            var ts: linux.timespec = .{
-                .sec = @intCast(left_ns / 1_000_000_000),
-                .nsec = @intCast(left_ns % 1_000_000_000),
-            };
-            _ = linux.futex(&self.count.raw, .{ .cmd = .WAIT, .private = true }, 0, .{ .timeout = &ts }, null, 0);
+            futexWait(&self.count, 0, left_ns);
         }
     }
 };
@@ -95,13 +134,13 @@ const JobQueue = struct {
     head: usize = 0,
     tail: usize = 0,
     lock: SpinLock = .{},
-    items: FutexSem = FutexSem.init(0),
-    space: FutexSem = FutexSem.init(queue_cap),
+    items: CountSem = CountSem.init(0),
+    space: CountSem = CountSem.init(queue_cap),
 
     fn push(q: *JobQueue, job: Job) void {
         q.space.wait();
         q.lock.lock();
-        q.ring[q.tail % queue_cap] = job;
+        q.ring[q.tail & (queue_cap - 1)] = job;
         q.tail += 1;
         q.lock.unlock();
         q.items.post();
@@ -110,7 +149,7 @@ const JobQueue = struct {
     fn pop(q: *JobQueue) Job {
         // Caller has already consumed one `items` token.
         q.lock.lock();
-        const job = q.ring[q.head % queue_cap];
+        const job = q.ring[q.head & (queue_cap - 1)];
         q.head += 1;
         q.lock.unlock();
         q.space.post();
@@ -237,8 +276,7 @@ pub const Proxy = struct {
     }
 
     fn nextRandom(self: *Proxy) std.Random {
-        // SplitMix-style seed per connection: lock-free and decorrelated.
-        const s = self.rng_state.fetchAdd(0x9E3779B97F4A7C15, .monotonic) ^ sys.nanosNow();
+        const s = self.rng_state.fetchAdd(0x9E3779B97F4A7C15, .monotonic);
         var prng = std.Random.DefaultPrng.init(s);
         return prng.random();
     }
@@ -284,10 +322,6 @@ pub const Proxy = struct {
                 return;
             }
             _ = self.total.fetchAdd(1, .monotonic);
-            {
-                var buf: [64]u8 = undefined;
-                log("accepted connection from {s}", .{sys.formatSockAddr(&buf, &peer)});
-            }
             sys.setTcpOpts(fd);
             self.queue.push(.{ .fd = fd, .peer = peer });
             self.maybeGrowPool();
@@ -383,16 +417,16 @@ pub const Proxy = struct {
 /// directions are done the caller closes both fds.
 fn forward(client_fd: sys.fd_t, backend_fd: sys.fd_t) void {
     var buf: [copy_buf_size]u8 = undefined;
-    var fds = [2]linux.pollfd{
-        .{ .fd = client_fd, .events = linux.POLL.IN, .revents = 0 },
-        .{ .fd = backend_fd, .events = linux.POLL.IN, .revents = 0 },
+    var fds = [2]posix.pollfd{
+        .{ .fd = client_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = backend_fd, .events = posix.POLL.IN, .revents = 0 },
     };
     var open = [2]bool{ true, true };
-    const mask: i16 = linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR | linux.POLL.NVAL;
+    const mask: i16 = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
 
     while (open[0] or open[1]) {
         inline for (0..2) |k| {
-            fds[k].events = if (open[k]) linux.POLL.IN else 0;
+            fds[k].events = if (open[k]) posix.POLL.IN else 0;
             fds[k].revents = 0;
         }
         _ = posix.poll(&fds, -1) catch break;
@@ -585,7 +619,7 @@ test "reload changes the selection set" {
 
 test "reload from file keeps old config on failure" {
     var tmp_path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrint(&tmp_path_buf, "/tmp/gopf-test-{d}.json", .{linux.getpid()}) catch unreachable;
+    const path = std.fmt.bufPrint(&tmp_path_buf, "/tmp/gopf-test-{d}.json", .{sys.getPid()}) catch unreachable;
 
     // Write a good config file.
     writeTestFile(path, "{\"hosts\":[{\"addr\":\"127.0.0.1:33333\",\"weight\":5}]}");
@@ -622,22 +656,9 @@ test "reload from file keeps old config on failure" {
 }
 
 fn writeTestFile(path: []const u8, content: []const u8) void {
-    const fd = std.posix.openat(linux.AT.FDCWD, path, .{
-        .ACCMODE = .WRONLY,
-        .CREAT = true,
-        .TRUNC = true,
-    }, 0o644) catch @panic("openat");
-    defer sys.closeFd(fd);
-    var off: usize = 0;
-    while (off < content.len) {
-        const rc = linux.write(fd, content.ptr + off, content.len - off);
-        if (linux.errno(rc) != .SUCCESS) @panic("write");
-        off += rc;
-    }
+    sys.writeFile(path, content);
 }
 
 fn deleteTestFile(path: []const u8) void {
-    var buf: [256]u8 = undefined;
-    const zpath = std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return;
-    _ = linux.unlink(zpath);
+    sys.unlinkPath(path);
 }

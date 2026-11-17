@@ -1,30 +1,22 @@
-//! Backend configuration: JSON parsing, validation, and weighted random
-//! host selection. A Config owns all of its memory in a private arena and is
-//! reference counted (refs are guarded by the owner's lock) so a reload can
-//! swap it out while in-flight connections still use the old one.
+//! Backend configuration: typed JSON parse, validation, weighted random selection.
+//! Config owns memory in a private arena and is reference-counted for hot reload.
 
 const std = @import("std");
 const sys = @import("sys.zig");
 
 pub const Host = struct {
-    /// Original "host:port" text from the config file.
     addr: []const u8,
     weight: i64,
-    /// Pre-resolved address for IP literals / localhost. Null for names we
-    /// cannot resolve without libc DNS; dialing them fails at connect time
-    /// (same moment where Go's dial would fail).
+    /// Pre-resolved for IP literals / localhost; null if dial-time resolve needed.
     sockaddr: ?sys.SockAddr,
 };
 
 pub const Config = struct {
     hosts: []Host,
     weight_sum: i64,
-    /// Guarded by the owning Proxy's config lock. The "current config"
-    /// pointer itself holds one reference.
     refs: usize,
     arena: std.heap.ArenaAllocator,
 
-    /// Free all memory. Only call when refs == 0.
     pub fn destroy(self: *Config) void {
         self.arena.deinit();
     }
@@ -41,60 +33,51 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
-fn objGet(obj: *const std.json.ObjectMap, key: []const u8) ?std.json.Value {
-    // Go's encoding/json matches struct field names case-insensitively.
-    var it = obj.iterator();
-    while (it.next()) |e| {
-        if (std.ascii.eqlIgnoreCase(e.key_ptr.*, key)) return e.value_ptr.*;
-    }
-    return null;
+const FileHost = struct {
+    addr: []const u8,
+    weight: i64 = 0,
+};
+
+const FileRoot = struct {
+    hosts: []FileHost = &.{},
+};
+
+fn mapJsonErr(err: anyerror) ParseError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.MissingField => error.MissingAddr,
+        error.UnexpectedToken, error.InvalidNumber, error.Overflow => error.InvalidWeight,
+        error.UnknownField, error.DuplicateField, error.LengthMismatch => error.InvalidStructure,
+        else => error.InvalidJson,
+    };
 }
 
-/// Parse and validate a JSON config document:
-///   {"hosts":[{"addr":"host:port","weight":100}]}
-/// Keys are matched case-insensitively (Go encoding/json semantics).
-/// Returns a heap-owned Config with refs == 1.
+/// Parse `{"hosts":[{"addr":"host:port","weight":100}]}` (lowercase keys only).
+/// Missing `weight` defaults to 0. Returns a heap-owned Config with refs == 1.
 pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!*Config {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    const root = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch
-        return error.InvalidJson;
-    if (root != .object) return error.InvalidStructure;
+    const draft = std.json.parseFromSliceLeaky(FileRoot, a, text, .{
+        .allocate = .alloc_always,
+    }) catch |e| return mapJsonErr(e);
 
     var hosts = std.array_list.Managed(Host).init(a);
     var weight_sum: i64 = 0;
 
-    if (objGet(&root.object, "hosts")) |hosts_value| {
-        if (hosts_value != .array) return error.InvalidStructure;
-        for (hosts_value.array.items) |hv| {
-            if (hv != .object) return error.InvalidStructure;
-
-            const addr_value = objGet(&hv.object, "addr") orelse return error.MissingAddr;
-            if (addr_value != .string) return error.InvalidAddr;
-            const addr = addr_value.string;
-
-            // Every addr must split into host:port, even on weight-0 hosts;
-            // any illegal entry fails the whole load, like the Go original.
-            const hp = sys.splitHostPort(addr) catch return error.InvalidAddr;
-            const sockaddr: ?sys.SockAddr = sys.resolveDial(hp.host, hp.port) catch null;
-
-            const weight_value = objGet(&hv.object, "weight") orelse {
-                // Go: missing int field decodes as 0 (host disabled).
-                try hosts.append(.{ .addr = addr, .weight = 0, .sockaddr = sockaddr });
-                continue;
-            };
-            if (weight_value != .integer) return error.InvalidWeight;
-            const weight = weight_value.integer;
-            if (weight < 0) return error.NegativeWeight;
-            weight_sum = std.math.add(i64, weight_sum, weight) catch return error.WeightOverflow;
-            try hosts.append(.{ .addr = addr, .weight = weight, .sockaddr = sockaddr });
-        }
+    for (draft.hosts) |h| {
+        const hp = sys.splitHostPort(h.addr) catch return error.InvalidAddr;
+        const sockaddr: ?sys.SockAddr = sys.resolveDial(hp.host, hp.port) catch null;
+        if (h.weight < 0) return error.NegativeWeight;
+        weight_sum = std.math.add(i64, weight_sum, h.weight) catch return error.WeightOverflow;
+        try hosts.append(.{
+            .addr = h.addr,
+            .weight = h.weight,
+            .sockaddr = sockaddr,
+        });
     }
 
-    // Validation of every addr happens even for weight-0 hosts: any illegal
-    // entry fails the whole load, like the Go original.
     const cfg = try a.create(Config);
     cfg.* = .{
         .hosts = try hosts.toOwnedSlice(),
@@ -105,9 +88,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!*Config {
     return cfg;
 }
 
-/// Weighted random selection: draw uniform r in [0, weight_sum), then walk
-/// cumulative weights. Returns null when no backend is usable
-/// (weight_sum <= 0). Weight-0 hosts are never selected.
+/// Weighted random selection in `[0, weight_sum)`. Null when `weight_sum <= 0`.
 pub fn chooseHost(hosts: []const Host, weight_sum: i64, random: std.Random) ?usize {
     if (weight_sum <= 0) return null;
     const target = random.uintLessThan(u64, @intCast(weight_sum));
@@ -117,11 +98,8 @@ pub fn chooseHost(hosts: []const Host, weight_sum: i64, random: std.Random) ?usi
         cumulative += @intCast(h.weight);
         if (target < cumulative) return i;
     }
-    // Unreachable in theory; mirrors the Go fallback.
     return if (hosts.len > 0) hosts.len - 1 else null;
 }
-
-// ============================== tests ==============================
 
 const testing = std.testing;
 
@@ -138,46 +116,50 @@ test "parse valid config" {
     try testing.expectEqual(@as(u16, 8001), cfg.hosts[0].sockaddr.?.port());
 }
 
-test "parse accepts Go-style capitalized keys" {
-    // The reference settings.conf uses "Hosts"/"Addr"/"Weight".
-    const cfg = try parse(testing.allocator,
+test "parse rejects capitalized keys" {
+    try testing.expectError(error.InvalidStructure, parse(testing.allocator,
         \\{"Hosts":[{"Addr":"127.0.0.1:80","Weight":100}]}
+    ));
+}
+
+test "missing weight defaults to zero" {
+    const cfg = try parse(testing.allocator,
+        \\{"hosts":[{"addr":"127.0.0.1:80"}]}
     );
     defer cfg.destroy();
-    try testing.expectEqual(@as(usize, 1), cfg.hosts.len);
-    try testing.expectEqual(@as(i64, 100), cfg.weight_sum);
+    try testing.expectEqual(@as(i64, 0), cfg.hosts[0].weight);
+    try testing.expectEqual(@as(i64, 0), cfg.weight_sum);
 }
 
 test "invalid addresses fail the whole load" {
     const cases = [_][]const u8{
         \\{"hosts":[{"addr":"no-colon-here","weight":1}]}
-    ,
+        ,
         \\{"hosts":[{"addr":"127.0.0.1:99999","weight":1}]}
-    ,
+        ,
         \\{"hosts":[{"addr":"127.0.0.1:abc","weight":1}]}
-    ,
+        ,
         \\{"hosts":[{"addr":"127.0.0.1:","weight":1}]}
-    ,
+        ,
         \\{"hosts":[{"addr":"::1:80","weight":1}]}
-    , // unbracketed IPv6
+        ,
         \\{"hosts":[{"addr":"[::1:80","weight":1}]}
-    , // missing ']'
+        ,
         \\{"hosts":[{"weight":1}]}
-    , // missing addr
+        ,
     };
     for (cases) |c| {
         if (parse(testing.allocator, c)) |cfg| {
             cfg.destroy();
-            return error.TestUnexpectedResult; // should have failed
+            return error.TestUnexpectedResult;
         } else |_| {}
     }
 }
 
 test "negative weight fails the whole load" {
-    const r = parse(testing.allocator,
+    try testing.expectError(error.NegativeWeight, parse(testing.allocator,
         \\{"hosts":[{"addr":"127.0.0.1:80","weight":-5}]}
-    );
-    try testing.expectError(error.NegativeWeight, r);
+    ));
 }
 
 test "empty hosts loads with weight_sum 0 and no selection" {
@@ -203,10 +185,9 @@ test "all-zero weights load but select nothing" {
 }
 
 test "non-integer weight is rejected" {
-    const r = parse(testing.allocator,
+    try testing.expectError(error.InvalidWeight, parse(testing.allocator,
         \\{"hosts":[{"addr":"127.0.0.1:80","weight":1.5}]}
-    );
-    try testing.expectError(error.InvalidWeight, r);
+    ));
 }
 
 test "weighted choice hits 1:2 ratio over 100k draws" {
@@ -221,7 +202,6 @@ test "weighted choice hits 1:2 ratio over 100k draws" {
         const i = chooseHost(&hosts, 3, prng.random()).?;
         counts[i] += 1;
     }
-    // Expected 1/3 and 2/3; allow generous but meaningful slack.
     try testing.expect(counts[0] > 31_000 and counts[0] < 35_667);
     try testing.expect(counts[1] > 64_333 and counts[1] < 69_000);
     try testing.expectEqual(@as(u64, n), counts[0] + counts[1]);
@@ -281,6 +261,6 @@ test "ip literal parsers" {
     try testing.expectEqual([16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 }, mapped);
     _ = sys.parseIp6("fe80::a:b:c:d:e").?;
     try testing.expectEqual(@as(?[16]u8, null), sys.parseIp6("1::2::3"));
-    try testing.expectEqual(@as(?[16]u8, null), sys.parseIp6("1:2:3:4:5:6:7")); // too short
-    try testing.expectEqual(@as(?[16]u8, null), sys.parseIp6("1:2:3:4:5:6:7:8:9")); // too long
+    try testing.expectEqual(@as(?[16]u8, null), sys.parseIp6("1:2:3:4:5:6:7"));
+    try testing.expectEqual(@as(?[16]u8, null), sys.parseIp6("1:2:3:4:5:6:7:8:9"));
 }
