@@ -11,3 +11,6 @@ zig-cache/
 # 压测二进制
 bench_backend
 bench_load
+
+# 验收测试临时目录
+codex-kimi-k3/verify/_tmp/
