@@ -1,5 +1,9 @@
 # gopf-zig
 
+> qwen4-max还得再练练
+> accept爆thread数
+> reload和accept放到一起
+
 用 **Zig 0.17.0** 复现的 [gopf](https://github.com/RaindyRoye/gopf)：一个 Go 写的四层（TCP）负载均衡器。
 语义对齐参考实现（`main.go`，308 行）：加权**随机**选后端、双向转发 + 半关闭、5 秒拨号超时、60 秒 TCP keepalive、SIGHUP 热重载、SIGUSR1 状态、SIGTERM/SIGINT 退出。
 
