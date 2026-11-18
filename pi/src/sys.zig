@@ -1,5 +1,5 @@
 //! Portable TCP helpers over libc/posix (Linux + macOS).
-//! Sockets are blocking; connect timeout uses SO_SNDTIMEO.
+//! Connect uses SO_SNDTIMEO; forwarding switches connected sockets to nonblocking mode.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -271,6 +271,14 @@ pub fn closeFd(fd: fd_t) void {
     _ = c.close(fd);
 }
 
+pub fn setNonblocking(fd: fd_t, enabled: bool) SockError!void {
+    const flags = c.fcntl(fd, posix.F.GETFL);
+    if (flags < 0) return mapCommonErr(posix.errno(flags));
+    const nonblocking: c_int = @bitCast(posix.O{ .NONBLOCK = true });
+    const updated = if (enabled) flags | nonblocking else flags & ~nonblocking;
+    if (c.fcntl(fd, posix.F.SETFL, updated) < 0) return mapCommonErr(posix.errno(-1));
+}
+
 pub fn shutdownWr(fd: fd_t) void {
     _ = c.shutdown(fd, posix.SHUT.WR);
 }
@@ -353,33 +361,49 @@ fn sendFlags() u32 {
     return 0;
 }
 
+fn sendSome(fd: fd_t, bytes: []const u8) SockError!?usize {
+    while (true) {
+        const n = c.send(fd, bytes.ptr, bytes.len, sendFlags());
+        if (n >= 0) return @as(usize, @intCast(n));
+        switch (posix.errno(n)) {
+            .INTR => continue,
+            .AGAIN => return null,
+            .PIPE, .CONNRESET => return error.Refused,
+            else => |e| return mapCommonErr(e),
+        }
+    }
+}
+
 pub fn writeAll(fd: fd_t, bytes: []const u8) SockError!void {
     var off: usize = 0;
-    while (off < bytes.len) {
-        const n = c.send(fd, bytes.ptr + off, bytes.len - off, sendFlags());
-        if (n < 0) {
-            switch (posix.errno(n)) {
-                .INTR => continue,
-                .PIPE, .CONNRESET => return error.Refused,
-                else => |e| return mapCommonErr(e),
-            }
+    while (off < bytes.len) off += (try sendSome(fd, bytes[off..])) orelse return error.Unexpected;
+}
+
+/// Write to a nonblocking socket. Returns null if it would block.
+pub fn writeNonblocking(fd: fd_t, bytes: []const u8) SockError!?usize {
+    return sendSome(fd, bytes);
+}
+
+fn receiveSome(fd: fd_t, buf: []u8) SockError!?usize {
+    while (true) {
+        const n = c.read(fd, buf.ptr, buf.len);
+        if (n >= 0) return @as(usize, @intCast(n));
+        switch (posix.errno(n)) {
+            .INTR => continue,
+            .AGAIN => return null,
+            .CONNRESET => return error.Refused,
+            else => |e| return mapCommonErr(e),
         }
-        off += @intCast(n);
     }
 }
 
 pub fn readSome(fd: fd_t, buf: []u8) SockError!usize {
-    while (true) {
-        const n = c.read(fd, buf.ptr, buf.len);
-        if (n < 0) {
-            switch (posix.errno(n)) {
-                .INTR => continue,
-                .CONNRESET => return error.Refused,
-                else => |e| return mapCommonErr(e),
-            }
-        }
-        return @intCast(n);
-    }
+    return (try receiveSome(fd, buf)) orelse error.Unexpected;
+}
+
+/// Read from a nonblocking socket. Returns null for would-block and 0 for EOF.
+pub fn readNonblocking(fd: fd_t, buf: []u8) SockError!?usize {
+    return receiveSome(fd, buf);
 }
 
 pub fn getSockName(fd: fd_t) SockError!SockAddr {

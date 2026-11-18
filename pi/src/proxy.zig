@@ -6,7 +6,7 @@
 //! futex/ulock wakeups; a worker runs the whole connection lifetime,
 //! duplexing both directions in a single poll(2) loop.
 //!
-//! All buffers live on thread stacks; the hot path performs no heap
+//! Forwarding buffers live on thread stacks; the hot path performs no heap
 //! allocations.
 
 const std = @import("std");
@@ -275,12 +275,6 @@ pub const Proxy = struct {
         if (dead) cfg.destroy();
     }
 
-    fn nextRandom(self: *Proxy) std.Random {
-        const s = self.rng_state.fetchAdd(0x9E3779B97F4A7C15, .monotonic);
-        var prng = std.Random.DefaultPrng.init(s);
-        return prng.random();
-    }
-
     fn spawnWorker(self: *Proxy) !void {
         _ = self.n_workers.fetchAdd(1, .acq_rel);
         const t = std.Thread.spawn(.{ .stack_size = worker_stack_size }, workerMain, .{self}) catch |e| {
@@ -388,7 +382,9 @@ pub const Proxy = struct {
         };
         defer self.releaseConfig(cfg);
 
-        const idx = config_mod.chooseHost(cfg.hosts, cfg.weight_sum, self.nextRandom()) orelse {
+        const seed = self.rng_state.fetchAdd(0x9E3779B97F4A7C15, .monotonic);
+        var prng = std.Random.DefaultPrng.init(seed);
+        const idx = config_mod.chooseHost(cfg.hosts, cfg.weight_sum, prng.random()) orelse {
             log("no available backend hosts to forward connection; closing", .{});
             return;
         };
@@ -411,40 +407,72 @@ pub const Proxy = struct {
     }
 };
 
-/// Bidirectional copy in a single poll(2) loop. When one direction hits EOF
-/// (or an unrecoverable error) we propagate a half-close: shutdown(dst, WR)
-/// so the peer sees FIN, while the other direction keeps flowing. When both
-/// directions are done the caller closes both fds.
+const Direction = struct {
+    buffer: [copy_buf_size]u8 = undefined,
+    start: usize = 0,
+    end: usize = 0,
+    open: bool = true,
+
+    fn hasPending(self: *const Direction) bool {
+        return self.start < self.end;
+    }
+
+    fn finish(self: *Direction, dst: sys.fd_t) void {
+        self.open = false;
+        self.start = self.end;
+        sys.shutdownWr(dst);
+    }
+
+    fn flush(self: *Direction, dst: sys.fd_t) void {
+        const sent = sys.writeNonblocking(dst, self.buffer[self.start..self.end]) catch return self.finish(dst);
+        const n = sent orelse return;
+        if (n == 0) return self.finish(dst);
+        self.start += n;
+    }
+
+    fn read(self: *Direction, src: sys.fd_t, dst: sys.fd_t) void {
+        const received = sys.readNonblocking(src, &self.buffer) catch return self.finish(dst);
+        const n = received orelse return;
+        if (n == 0) return self.finish(dst);
+        self.start = 0;
+        self.end = n;
+        self.flush(dst);
+    }
+};
+
+/// Each direction stops reading while it has pending output. The opposite
+/// direction stays eligible, and EOF is forwarded only after pending data.
 fn forward(client_fd: sys.fd_t, backend_fd: sys.fd_t) void {
-    var buf: [copy_buf_size]u8 = undefined;
-    var fds = [2]posix.pollfd{
-        .{ .fd = client_fd, .events = posix.POLL.IN, .revents = 0 },
-        .{ .fd = backend_fd, .events = posix.POLL.IN, .revents = 0 },
+    const sockets = [2]sys.fd_t{ client_fd, backend_fd };
+    for (sockets) |fd| sys.setNonblocking(fd, true) catch |err| {
+        log("failed to set forwarding socket nonblocking: {s}", .{@errorName(err)});
+        return;
     };
-    var open = [2]bool{ true, true };
-    const mask: i16 = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
 
-    while (open[0] or open[1]) {
-        inline for (0..2) |k| {
-            fds[k].events = if (open[k]) posix.POLL.IN else 0;
-            fds[k].revents = 0;
+    // Direction i reads sockets[i] and writes the other socket.
+    var directions = [2]Direction{ .{}, .{} };
+    const terminal_events = posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
+
+    while (directions[0].open or directions[1].open) {
+        var fds: [2]posix.pollfd = undefined;
+        for (&fds, 0..) |*fd, i| {
+            const outgoing = &directions[i];
+            var events: i16 = 0;
+            if (outgoing.open and !outgoing.hasPending()) events |= posix.POLL.IN;
+            if (directions[1 - i].hasPending()) events |= posix.POLL.OUT;
+            fd.* = .{ .fd = if (events != 0) sockets[i] else -1, .events = events, .revents = 0 };
         }
-        _ = posix.poll(&fds, -1) catch break;
+        _ = posix.poll(&fds, -1) catch return;
 
-        inline for (0..2) |k| {
-            if (open[k] and (fds[k].revents & mask) != 0) {
-                const dst = fds[1 - k].fd;
-                const n = sys.readSome(fds[k].fd, &buf) catch 0;
-                if (n == 0) {
-                    // EOF or read error: half-close the opposite write side.
-                    open[k] = false;
-                    sys.shutdownWr(dst);
-                } else {
-                    sys.writeAll(dst, buf[0..n]) catch {
-                        open[k] = false;
-                        sys.shutdownWr(dst);
-                    };
+        for (&directions, 0..) |*direction, src| {
+            if (!direction.open) continue;
+            const dst = 1 - src;
+            if (direction.hasPending()) {
+                if (fds[dst].revents & (posix.POLL.OUT | terminal_events) != 0) {
+                    direction.flush(sockets[dst]);
                 }
+            } else if (fds[src].revents & (posix.POLL.IN | terminal_events) != 0) {
+                direction.read(sockets[src], sockets[dst]);
             }
         }
     }
@@ -533,6 +561,87 @@ test "forward small echo packet" {
     try testing.expectEqualStrings(msg, buf[0..got]);
 }
 
+test "forward reverse traffic while the other direction is backpressured" {
+    const client, const backend = pairs: {
+        var client: [2]sys.fd_t = undefined;
+        try testing.expectEqual(@as(c_int, 0), std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &client));
+        errdefer for (client) |fd| sys.closeFd(fd);
+        var backend: [2]sys.fd_t = undefined;
+        try testing.expectEqual(@as(c_int, 0), std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &backend));
+        break :pairs .{ client, backend };
+    };
+    var worker: ?std.Thread = null;
+    defer {
+        sys.closeFd(client[0]);
+        sys.closeFd(backend[0]);
+        if (worker) |thread| thread.join();
+        sys.closeFd(client[1]);
+        sys.closeFd(backend[1]);
+    }
+    try sys.setNonblocking(client[0], true);
+    try sys.setNonblocking(backend[0], true);
+
+    // Fill the proxy's send buffer toward the client, which has not read yet.
+    const send_buffer: c_int = 4096;
+    try posix.setsockopt(client[1], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&send_buffer));
+    try sys.setNonblocking(client[1], true);
+    const filler: [4096]u8 = @splat('x');
+    var filled: usize = 0;
+    while (try sys.writeNonblocking(client[1], &filler)) |n| {
+        try testing.expect(n > 0);
+        filled += n;
+    }
+    while (try sys.writeNonblocking(client[1], "x")) |n| {
+        try testing.expectEqual(@as(usize, 1), n);
+        filled += n;
+    }
+    try sys.setNonblocking(client[1], false);
+    try sys.writeAll(backend[0], "b");
+
+    if (@hasDecl(posix.SO, "NOSIGPIPE")) {
+        const enabled: c_int = 1;
+        try posix.setsockopt(client[1], posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&enabled));
+        try posix.setsockopt(backend[1], posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&enabled));
+    }
+    worker = try std.Thread.spawn(.{}, forward, .{ client[1], backend[1] });
+
+    // Wait until the proxy has read "b" and must contend with the full buffer.
+    var readable = [1]posix.pollfd{.{ .fd = backend[1], .events = posix.POLL.IN, .revents = 0 }};
+    const deadline = sys.nanosNow() + 2 * std.time.ns_per_s;
+    while (try posix.poll(&readable, 0) != 0) {
+        if (sys.nanosNow() >= deadline) return error.Timeout;
+        sys.sleepMs(1);
+    }
+
+    try sys.writeAll(client[0], "c");
+    readable[0].fd = backend[0];
+    try testing.expectEqual(@as(usize, 1), try posix.poll(&readable, 2000));
+    var byte: [1]u8 = undefined;
+    try testing.expectEqual(@as(?usize, 1), try sys.readNonblocking(backend[0], &byte));
+    try testing.expectEqualStrings("c", &byte);
+
+    // Let the pending byte drain. The backend's FIN must follow that byte.
+    sys.shutdownWr(backend[0]);
+    sys.shutdownWr(client[0]);
+    readable[0].fd = client[0];
+    const drain_deadline = sys.nanosNow() + 2 * std.time.ns_per_s;
+    var received: usize = 0;
+    var chunk: [filler.len]u8 = undefined;
+    while (true) {
+        const left_ns = drain_deadline -| sys.nanosNow();
+        if (left_ns == 0) return error.Timeout;
+        const left_ms = (left_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
+        try testing.expectEqual(@as(usize, 1), try posix.poll(&readable, @intCast(left_ms)));
+        const n = (try sys.readNonblocking(client[0], &chunk)) orelse continue;
+        if (n == 0) break;
+        const filler_bytes = @min(n, filled -| received);
+        try testing.expectEqualSlices(u8, filler[0..filler_bytes], chunk[0..filler_bytes]);
+        if (filler_bytes < n) try testing.expectEqualStrings("b", chunk[filler_bytes..n]);
+        received += n;
+    }
+    try testing.expectEqual(filled + 1, received);
+}
+
 test "half-close: remaining data still delivered after client FIN" {
     const echo = try startEchoServer();
     const proxy = try startProxyWithBackends(testing.allocator, &.{echo});
@@ -573,13 +682,20 @@ test "forward 1 MiB payload byte-identical" {
     const c = connectOrFail(&proxy_addr);
     defer sys.closeFd(c);
 
+    const read_timeout: posix.timeval = .{ .sec = 5, .usec = 0 };
+    try posix.setsockopt(c, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&read_timeout));
+
     const size = 1 << 20;
     const payload = try testing.allocator.alloc(u8, size);
     defer testing.allocator.free(payload);
-    for (payload, 0..) |*b, i| b.* = @truncate(i *% 131 +% 17);
+    var prng = std.Random.DefaultPrng.init(0);
+    prng.random().bytes(payload);
 
     const wt = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, bulkWriter, .{ c, payload });
-    wt.join();
+    defer {
+        _ = std.c.shutdown(c, posix.SHUT.RDWR);
+        wt.join();
+    }
 
     var received = std.array_list.Managed(u8).init(testing.allocator);
     defer received.deinit();
